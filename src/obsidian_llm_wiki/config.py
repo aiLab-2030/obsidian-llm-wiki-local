@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+import tomllib
+from pathlib import Path
+
+from pydantic import BaseModel, field_validator
+
+DEFAULT_WIKI_TOML = """\
+[models]
+fast = "gemma4:e4b"
+heavy = "qwen2.5:14b"
+# Optional: set heavy = fast to use a single model for everything
+
+[ollama]
+url = "http://localhost:11434"
+timeout = 600
+fast_ctx = 8192
+heavy_ctx = 16384
+
+[pipeline]
+auto_approve = false
+auto_commit = true
+watch_debounce = 3.0
+max_concepts_per_source = 8
+"""
+
+
+class ModelsConfig(BaseModel):
+    fast: str = "gemma4:e4b"
+    heavy: str = "qwen2.5:14b"
+    embed: str = "nomic-embed-text"  # used only when RAG optional dependency is installed
+
+
+class OllamaConfig(BaseModel):
+    url: str = "http://localhost:11434"
+    timeout: float = 600.0  # seconds; 14B models over network need >5min
+    fast_ctx: int = 8192
+    heavy_ctx: int = 16384
+
+
+class PipelineConfig(BaseModel):
+    auto_approve: bool = False
+    auto_commit: bool = True
+    watch_debounce: float = 3.0
+    max_concepts_per_source: int = 8
+
+
+class RagConfig(BaseModel):
+    chunk_size: int = 512
+    chunk_overlap: int = 50
+    similarity_threshold: float = 0.7
+
+
+class Config(BaseModel):
+    vault: Path
+    models: ModelsConfig = ModelsConfig()
+    ollama: OllamaConfig = OllamaConfig()
+    pipeline: PipelineConfig = PipelineConfig()
+    rag: RagConfig = RagConfig()
+
+    @field_validator("vault", mode="before")
+    @classmethod
+    def resolve_vault(cls, v: str | Path) -> Path:
+        return Path(v).expanduser().resolve()
+
+    @property
+    def raw_dir(self) -> Path:
+        return self.vault / "raw"
+
+    @property
+    def wiki_dir(self) -> Path:
+        return self.vault / "wiki"
+
+    @property
+    def drafts_dir(self) -> Path:
+        return self.vault / "wiki" / ".drafts"
+
+    @property
+    def olw_dir(self) -> Path:
+        return self.vault / ".olw"
+
+    @property
+    def state_db_path(self) -> Path:
+        return self.olw_dir / "state.db"
+
+    @property
+    def chroma_dir(self) -> Path:
+        return self.olw_dir / "chroma"
+
+    @property
+    def sources_dir(self) -> Path:
+        return self.vault / "wiki" / "sources"
+
+    @property
+    def queries_dir(self) -> Path:
+        return self.vault / "wiki" / "queries"
+
+    @property
+    def schema_path(self) -> Path:
+        return self.vault / "vault-schema.md"
+
+    @classmethod
+    def from_vault(cls, vault_path: Path, **overrides) -> Config:
+        vault = Path(vault_path).expanduser().resolve()
+        config_file = vault / "wiki.toml"
+        file_config: dict = {}
+        if config_file.exists():
+            with open(config_file, "rb") as f:
+                file_config = tomllib.load(f)
+        # Merge overrides into nested dicts
+        for key, val in overrides.items():
+            if val is not None:
+                file_config[key] = val
+        return cls(vault=vault, **file_config)

@@ -1,0 +1,272 @@
+# obsidian-llm-wiki
+
+**Turn your raw notes into a self-maintaining, interlinked wiki — powered by a local LLM.**
+
+Drop a markdown file into a folder. An AI reads it, extracts concepts, and either creates new wiki articles or updates existing ones with the new knowledge. Over time your wiki compounds: every note you add makes the whole smarter and more connected.
+
+**100% local. No cloud, no API keys, no telemetry.** Just [Ollama](https://ollama.com) running on your machine.
+
+---
+
+## The idea (Karpathy's LLM Wiki)
+
+This project is a practical implementation of the pattern described by Andrej Karpathy in [**"The LLM Wiki"**](https://karpathy.ai/llmwiki) — a vision for a personal knowledge base where:
+
+> *"The LLM doesn't just store what you tell it — it synthesizes, cross-references, and keeps everything current. You add raw material; it does the bookkeeping."*
+
+The key insight: treat your notes as **source material**, not as the final artifact. The LLM compiles them into a structured wiki that grows smarter as you add more. Unlike a chatbot that forgets, the wiki **persists and compounds**.
+
+```
+You write raw notes  →  LLM extracts concepts  →  Wiki articles created/updated
+     raw/                    (automatic)                    wiki/
+  quantum.md          "Qubit", "Superposition"       Qubit.md  ←──┐
+  ml-basics.md        "Neural Network", "SGD"    Superposition.md  │
+  physics.md          "Qubit" (again!)           Neural Network.md │
+                                                      ↑  linked via [[wikilinks]]
+```
+
+The wiki lives in Obsidian, so you get the graph view, backlinks, and Dataview queries for free.
+
+---
+
+## Features
+
+- **Concept-driven, incremental compilation** — each concept gets its own article, updated only when its source notes change
+- **Manual edit protection** — edited an article by hand? The compiler detects the change and skips it
+- **Source traceability** — every article links back to the raw notes it was built from
+- **Draft review workflow** — articles land in `.drafts/` for human approval before publishing
+- **File watcher** — `olw watch` auto-processes anything dropped into `raw/`
+- **Wiki health checks** — `olw lint` detects orphans, broken links, stale articles (no LLM needed)
+- **Query your wiki** — `olw query "what is X?"` answers from your published articles
+- **Git safety net** — every auto-action is committed; `olw undo` reverts safely
+- **Offline test suite** — all 117 tests run without Ollama
+
+---
+
+## Quick start
+
+### 1. Install
+
+```bash
+pip install obsidian-llm-wiki
+```
+
+Or with [uv](https://docs.astral.sh/uv/) (recommended):
+
+```bash
+uv tool install obsidian-llm-wiki
+```
+
+### 2. Install and start Ollama
+
+```bash
+# Install Ollama: https://ollama.com/download
+ollama pull gemma3:4b       # fast model — analysis and routing
+ollama pull qwen2.5:14b     # heavy model — article writing (optional, 7B+ recommended)
+```
+
+> **Minimal setup:** set both `fast` and `heavy` to `gemma3:4b` in `wiki.toml` to use a single model.
+
+### 3. Set up your vault
+
+```bash
+olw init ~/my-wiki
+```
+
+This creates the folder structure and a `wiki.toml` config file.
+
+### 4. Add some notes
+
+Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes, anything.
+
+```
+~/my-wiki/raw/
+  quantum-computing.md
+  ml-fundamentals.md
+  physics-lecture.md
+```
+
+### 5. Run the pipeline
+
+```bash
+# Analyze notes, extract concepts
+olw ingest --vault ~/my-wiki --all
+
+# Generate wiki articles (lands in .drafts/)
+olw compile --vault ~/my-wiki
+
+# Review drafts, then publish
+olw approve --vault ~/my-wiki --all
+```
+
+Open `~/my-wiki` as an Obsidian vault. The graph view shows your connected wiki.
+
+### 6. Keep it running (optional)
+
+```bash
+olw watch --vault ~/my-wiki
+# Drop a file in raw/ → ingest + compile happen automatically
+```
+
+---
+
+## How it works
+
+The pipeline has three stages, each using the LLM for a different purpose:
+
+```
+raw/note.md
+    │
+    ▼ olw ingest
+    Fast LLM (3B–8B)
+    • Reads note
+    • Extracts concept names
+    • Writes quality score + summary to state.db
+    • Creates wiki/sources/Note.md (source summary page)
+    │
+    ▼ olw compile
+    Heavy LLM (7B–14B)
+    • For each concept: gathers all source notes that mention it
+    • Writes a wiki article with [[wikilinks]] to related concepts
+    • Lands in wiki/.drafts/ for review
+    │
+    ▼ olw approve
+    • Moves draft to wiki/
+    • Updates wiki/index.md (navigation layer)
+    • Git commits the change
+```
+
+**No vector databases, no embeddings.** `wiki/index.md` acts as the routing layer for `olw query`. This keeps the setup simple and works well up to ~100 source notes.
+
+---
+
+## Vault structure
+
+```
+my-wiki/
+├── raw/                        ← YOUR NOTES (never modified by olw)
+│   ├── quantum-computing.md
+│   └── ml-fundamentals.md
+├── wiki/
+│   ├── Quantum Computing.md    ← concept articles (flat, one per concept)
+│   ├── Machine Learning.md
+│   ├── sources/                ← auto-generated source summaries
+│   │   ├── Quantum Computing Fundamentals.md
+│   │   └── ML Fundamentals.md
+│   ├── queries/                ← saved Q&A answers (olw query --save)
+│   ├── .drafts/                ← pending human review
+│   ├── index.md                ← auto-generated navigation + routing layer
+│   └── log.md                  ← append-only operation history
+├── vault-schema.md             ← LLM context: conventions for this vault
+├── wiki.toml                   ← configuration
+└── .olw/
+    └── state.db                ← SQLite: notes, concepts, articles, hashes
+```
+
+`raw/` is immutable — `olw` never writes to it. All metadata lives in `state.db`.
+
+---
+
+## Configuration
+
+`wiki.toml` (created by `olw init`):
+
+```toml
+[models]
+fast = "gemma3:4b"        # extraction, analysis, query routing
+heavy = "qwen2.5:14b"     # article generation, Q&A answers
+# Single-model: set heavy = fast
+
+[ollama]
+url = "http://localhost:11434"   # supports LAN: http://192.168.1.x:11434
+timeout = 900
+
+[pipeline]
+auto_approve = false             # true = skip draft review
+auto_commit = true               # git commit after each operation
+max_concepts_per_source = 8      # limit concepts extracted per note
+watch_debounce = 3.0             # seconds after last file event before processing
+```
+
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `olw init PATH` | Create vault structure and git repo |
+| `olw init PATH --existing` | Adopt an existing Obsidian vault |
+| `olw doctor` | Check Ollama, models, vault structure |
+| `olw ingest --all` | Analyze all raw notes |
+| `olw ingest FILE` | Analyze one note |
+| `olw compile` | Generate wiki articles → `.drafts/` |
+| `olw compile --retry-failed` | Retry previously failed notes |
+| `olw approve --all` | Publish all drafts |
+| `olw approve FILE` | Publish one draft |
+| `olw reject FILE` | Discard a draft |
+| `olw status` | Show pipeline state and pending drafts |
+| `olw status --failed` | List failed notes with error messages |
+| `olw query "question"` | Answer from your wiki |
+| `olw query "..." --save` | Answer and save to `wiki/queries/` |
+| `olw lint` | Health check: orphans, broken links, stale articles |
+| `olw lint --fix` | Auto-fix missing frontmatter fields |
+| `olw watch` | File watcher — auto-pipeline on new notes |
+| `olw watch --auto-approve` | Watch + auto-publish (no manual review) |
+| `olw undo` | Revert last `[olw]` git commit |
+| `olw clean` | Clear state DB + wiki/, keep raw/ notes |
+
+All commands accept `--vault PATH` or the env var `OLW_VAULT`.
+
+---
+
+## Model recommendations
+
+| Role | Recommended | Minimum |
+|------|-------------|---------|
+| Fast (analysis + routing) | `gemma3:4b`, `llama3.2:3b` | any 3B with JSON format |
+| Heavy (article writing) | `qwen2.5:14b`, `llama3.1:8b` | any 7B |
+| Single model (everything) | `llama3.1:8b`, `mistral:7b` | any 7B |
+
+Any [Ollama model](https://ollama.com/library) with JSON format support works. The tool degrades gracefully with smaller models — they produce shorter, simpler articles but the pipeline still functions.
+
+---
+
+## Obsidian tips
+
+- **Graph view** — concept pages link to source pages and each other via `[[wikilinks]]`; the graph shows how your knowledge connects
+- **Dataview** — query by `status: published`, `confidence: > 0.7`, `tags: [physics]`, etc.
+- **Backlinks** — every concept page shows which source pages mention it
+- **Web Clipper** — save web articles directly to `raw/` (see [docs/web-clipper-setup.md](docs/web-clipper-setup.md))
+
+---
+
+## Running the tests
+
+All tests are offline — no Ollama required.
+
+```bash
+git clone https://github.com/kytmanov/obsidian-llm-wiki
+cd obsidian-llm-wiki
+uv sync --group dev
+uv run pytest
+```
+
+For the full end-to-end smoke test (requires a running Ollama instance):
+
+```bash
+OLLAMA_URL=http://localhost:11434 bash scripts/smoke_test.sh
+```
+
+---
+
+## Why not just use a chatbot?
+
+Chatbots forget. Every conversation starts fresh. This tool builds a **persistent artifact** — a wiki that grows with every note you add, that you can open in Obsidian, search, query, and edit by hand.
+
+The LLM is a compiler, not a conversation partner. You give it raw material; it produces structured knowledge. The output is plain markdown files you own forever.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

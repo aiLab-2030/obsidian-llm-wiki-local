@@ -1,0 +1,216 @@
+"""
+Obsidian vault file operations.
+
+Uses python-frontmatter (not regex split) so --- inside note bodies
+doesn't corrupt parsing.
+"""
+
+from __future__ import annotations
+
+import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import frontmatter
+
+# ── Frontmatter ───────────────────────────────────────────────────────────────
+
+
+def parse_note(path: Path) -> tuple[dict[str, Any], str]:
+    """Return (frontmatter_dict, body_text). Safe against --- in body."""
+    post = frontmatter.load(str(path))
+    return dict(post.metadata), post.content
+
+
+def write_note(path: Path, metadata: dict[str, Any], body: str) -> None:
+    """Write markdown file with YAML frontmatter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(body, **metadata)
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
+    """Merge updates into existing frontmatter, preserve body."""
+    meta, body = parse_note(path)
+    meta.update(updates)
+    write_note(path, meta, body)
+
+
+# ── Wikilinks ─────────────────────────────────────────────────────────────────
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```|`[^`]+`")
+
+
+def extract_wikilinks(content: str) -> list[str]:
+    """Return all [[target]] titles found in content."""
+    return _WIKILINK_RE.findall(content)
+
+
+def _mask_code_blocks(content: str) -> tuple[str, list[tuple[int, int, str]]]:
+    """Replace code block content with placeholders, return original spans."""
+    spans: list[tuple[int, int, str]] = []
+    masked = content
+    offset = 0
+    for m in _CODE_BLOCK_RE.finditer(content):
+        start, end = m.start() + offset, m.end() + offset
+        placeholder = "X" * (end - start)
+        masked = masked[:start] + placeholder + masked[end:]
+        spans.append((start, end, m.group(0)))
+    return masked, spans
+
+
+def _restore_code_blocks(content: str, spans: list[tuple[int, int, str]]) -> str:
+    for start, end, original in spans:
+        content = content[:start] + original + content[end:]
+    return content
+
+
+def ensure_wikilinks(content: str, targets: list[str]) -> str:
+    """
+    Wrap exact whole-word title matches in [[wikilinks]].
+    Skips: code blocks, already-linked titles, partial-word matches.
+    Case-sensitive to avoid false positives.
+    """
+    if not targets:
+        return content
+
+    masked, spans = _mask_code_blocks(content)
+
+    for target in targets:
+        # Already linked? Skip.
+        if f"[[{target}]]" in masked or f"[[{target}|" in masked:
+            continue
+        # Whole-word boundary match, case-sensitive, first occurrence only
+        pattern = re.compile(r"(?<!\[)(?<!\|)\b" + re.escape(target) + r"\b(?!\])")
+        masked = pattern.sub(f"[[{target}]]", masked, count=1)
+
+    return _restore_code_blocks(masked, spans)
+
+
+# ── Article utilities ─────────────────────────────────────────────────────────
+
+
+def list_wiki_articles(wiki_dir: Path) -> list[tuple[str, Path]]:
+    """Return [(title, path)] for all non-draft wiki articles."""
+    articles = []
+    for md in wiki_dir.rglob("*.md"):
+        if ".drafts" in md.parts:
+            continue
+        try:
+            meta, _ = parse_note(md)
+            title = meta.get("title", md.stem)
+        except Exception:
+            title = md.stem
+        articles.append((title, md))
+    return articles
+
+
+def list_draft_articles(drafts_dir: Path) -> list[tuple[str, Path]]:
+    """Return [(title, path)] for all draft articles."""
+    if not drafts_dir.exists():
+        return []
+    articles = []
+    for md in drafts_dir.rglob("*.md"):
+        try:
+            meta, _ = parse_note(md)
+            title = meta.get("title", md.stem)
+            sources = meta.get("sources", [])
+        except Exception:
+            title = md.stem
+            sources = []
+        articles.append((title, md, sources))
+    return articles
+
+
+# ── Filename safety ───────────────────────────────────────────────────────────
+
+_FORBIDDEN_CHARS = re.compile(r'[*"\\/<>:|?#^\[\]]')
+
+
+def sanitize_filename(title: str, max_len: int = 100) -> str:
+    """Strip Obsidian-forbidden chars and truncate to max_len. Never returns empty string."""
+    name = _FORBIDDEN_CHARS.sub("", title).strip()
+    if len(name) > max_len:
+        # Truncate at word boundary
+        name = name[:max_len].rsplit(" ", 1)[0]
+    return name or "untitled"
+
+
+def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Write content to path atomically: write .tmp then rename (crash-safe)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with open(fd, "w", encoding=encoding) as f:
+            f.write(content)
+        Path(tmp).replace(path)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def generate_aliases(title: str, source_text: str) -> list[str]:
+    """
+    Generate aliases from title: always add lowercase variant.
+    Detect 'Full Name (ABBR)' patterns in source text and add abbreviations.
+    """
+    aliases: set[str] = set()
+    lower = title.lower()
+    if lower != title:
+        aliases.add(lower)
+    # Match: <title> (TWO_PLUS_CAPS)
+    pattern = re.compile(re.escape(title) + r"\s*\(([A-Z]{2,})\)")
+    for m in pattern.finditer(source_text):
+        aliases.add(m.group(1))
+    return sorted(aliases)
+
+
+def chunk_text(text: str, chunk_size: int = 512, overlap: int = 50) -> list[str]:
+    """
+    Split text into chunks. Primary split on ## headings; fallback to
+    word-count windows with overlap.
+    """
+    # Try heading-based split first
+    sections = re.split(r"\n(?=## )", text)
+    chunks: list[str] = []
+
+    for section in sections:
+        words = section.split()
+        if len(words) <= chunk_size:
+            if section.strip():
+                chunks.append(section.strip())
+        else:
+            # Sliding window
+            for i in range(0, len(words), chunk_size - overlap):
+                chunk = " ".join(words[i : i + chunk_size])
+                if chunk.strip():
+                    chunks.append(chunk.strip())
+
+    return chunks if chunks else [text.strip()]
+
+
+def build_wiki_frontmatter(
+    title: str,
+    tags: list[str],
+    sources: list[str],
+    confidence: float,
+    is_draft: bool = True,
+    existing_meta: dict | None = None,
+) -> dict[str, Any]:
+    now = datetime.now().strftime("%Y-%m-%d")
+    meta: dict[str, Any] = {
+        "title": title,
+        "tags": tags,
+        "sources": sources,
+        "confidence": round(confidence, 2),
+        "status": "draft" if is_draft else "published",
+        "updated": now,
+    }
+    if existing_meta and "created" in existing_meta:
+        meta["created"] = existing_meta["created"]
+    else:
+        meta["created"] = now
+    return meta

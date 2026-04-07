@@ -1,0 +1,224 @@
+"""
+Lint pipeline: all structural checks, no LLM required.
+
+Checks:
+  orphan           — concept page with no inbound [[wikilinks]] from other pages
+  broken_link      — [[Target]] in body that resolves to no file
+  missing_frontmatter — required fields (title, status, tags) absent
+  stale            — file hash on disk != DB content_hash (manually edited)
+  low_confidence   — confidence < LOW_CONFIDENCE_THRESHOLD
+
+Fix mode (--fix):
+  Auto-fixes missing_frontmatter fields by inserting sensible defaults.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from ..config import Config
+from ..models import LintIssue, LintResult
+from ..state import StateDB
+from ..vault import extract_wikilinks, parse_note, write_note
+
+_REQUIRED_FIELDS: frozenset[str] = frozenset({"title", "status", "tags"})
+_LOW_CONFIDENCE_THRESHOLD = 0.3
+
+# Pages excluded from orphan + link checks (meta / system pages)
+_SYSTEM_STEMS = frozenset({"index", "log"})
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _build_title_index(config: Config) -> dict[str, Path]:
+    """Map lowercase title/stem → path for every published wiki page."""
+    index: dict[str, Path] = {}
+    for md in config.wiki_dir.rglob("*.md"):
+        if ".drafts" in md.parts:
+            continue
+        index[md.stem.lower()] = md
+        try:
+            meta, _ = parse_note(md)
+            title = meta.get("title", "")
+            if title:
+                index[title.lower()] = md
+        except Exception:
+            pass
+    return index
+
+
+def _build_inbound_index(config: Config) -> dict[str, set[str]]:
+    """Map target title (lower) → set of page stems that link to it."""
+    inbound: dict[str, set[str]] = {}
+    for md in config.wiki_dir.rglob("*.md"):
+        if ".drafts" in md.parts:
+            continue
+        try:
+            _, body = parse_note(md)
+        except Exception:
+            continue
+        for link in extract_wikilinks(body):
+            key = link.lower()
+            inbound.setdefault(key, set()).add(md.stem)
+    return inbound
+
+
+def _concept_pages(config: Config) -> list[Path]:
+    """Root-level wiki pages that are concept articles (not system files)."""
+    if not config.wiki_dir.exists():
+        return []
+    pages = []
+    for md in sorted(config.wiki_dir.glob("*.md")):
+        if md.stem.lower() in _SYSTEM_STEMS:
+            continue
+        pages.append(md)
+    return pages
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
+    issues: list[LintIssue] = []
+
+    title_index = _build_title_index(config)
+    inbound_index = _build_inbound_index(config)
+
+    # DB records keyed by vault-relative path
+    db_articles = {a.path: a for a in db.list_articles(drafts_only=False) if not a.is_draft}
+
+    pages = _concept_pages(config)
+
+    for page in pages:
+        rel_path = str(page.relative_to(config.vault))
+
+        try:
+            meta, body = parse_note(page)
+        except Exception as exc:
+            issues.append(
+                LintIssue(
+                    path=rel_path,
+                    issue_type="missing_frontmatter",
+                    description=f"Failed to parse frontmatter: {exc}",
+                    suggestion="Fix or recreate the file.",
+                    auto_fixable=False,
+                )
+            )
+            continue
+
+        title = meta.get("title", page.stem)
+
+        # ── Missing frontmatter ───────────────────────────────────────────────
+        missing = _REQUIRED_FIELDS - set(meta.keys())
+        if missing:
+            issues.append(
+                LintIssue(
+                    path=rel_path,
+                    issue_type="missing_frontmatter",
+                    description=f"Missing fields: {', '.join(sorted(missing))}",
+                    suggestion=f"Add: {', '.join(f'{f}: ...' for f in sorted(missing))}",
+                    auto_fixable=True,
+                )
+            )
+            if fix:
+                for field in sorted(missing):
+                    if field == "title":
+                        meta["title"] = page.stem
+                    elif field == "status":
+                        meta["status"] = "published"
+                    elif field == "tags":
+                        meta["tags"] = []
+                write_note(page, meta, body)
+
+        # ── Low confidence ────────────────────────────────────────────────────
+        confidence = meta.get("confidence")
+        if confidence is not None:
+            try:
+                conf_val = float(confidence)
+                if conf_val < _LOW_CONFIDENCE_THRESHOLD:
+                    issues.append(
+                        LintIssue(
+                            path=rel_path,
+                            issue_type="low_confidence",
+                            description=(
+                                f"Confidence {conf_val:.2f} below "
+                                f"threshold {_LOW_CONFIDENCE_THRESHOLD}"
+                            ),
+                            suggestion="Add more source notes covering this concept.",
+                            auto_fixable=False,
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # ── Manually edited (stale hash) ──────────────────────────────────────
+        db_rec = db_articles.get(rel_path)
+        if db_rec:
+            if _file_hash(page) != db_rec.content_hash:
+                issues.append(
+                    LintIssue(
+                        path=rel_path,
+                        issue_type="stale",
+                        description="File modified manually since last compile.",
+                        suggestion=(
+                            "Run `olw compile --force` to recompile, "
+                            "or keep edits (page is protected)."
+                        ),
+                        auto_fixable=False,
+                    )
+                )
+
+        # ── Broken wikilinks ──────────────────────────────────────────────────
+        for link in extract_wikilinks(body):
+            if link.lower() not in title_index:
+                issues.append(
+                    LintIssue(
+                        path=rel_path,
+                        issue_type="broken_link",
+                        description=f"[[{link}]] has no matching wiki page",
+                        suggestion=f"Create a page for '{link}' or remove the link.",
+                        auto_fixable=False,
+                    )
+                )
+
+        # ── Orphan ───────────────────────────────────────────────────────────
+        # Linked-by: pages that contain [[title]] or [[stem]] in their body
+        linked_by = inbound_index.get(title.lower(), set()) | inbound_index.get(
+            page.stem.lower(), set()
+        )
+        # Exclude self-links and the index page
+        linked_by -= {page.stem, "index", "log"}
+        if not linked_by:
+            issues.append(
+                LintIssue(
+                    path=rel_path,
+                    issue_type="orphan",
+                    description="No other wiki page links to this page.",
+                    suggestion="Reference this concept from related pages or run `olw compile`.",
+                    auto_fixable=False,
+                )
+            )
+
+    # ── Health score ──────────────────────────────────────────────────────────
+    # Score based on % of clean pages (multiple issues on one page count once)
+    total = max(len(pages), 1)
+    pages_with_issues = len({iss.path for iss in issues})
+    score = round(100.0 * (1 - pages_with_issues / total), 1)
+
+    # Summary
+    if not issues:
+        summary = f"Wiki healthy. {len(pages)} concept pages, no issues."
+    else:
+        counts: dict[str, int] = {}
+        for iss in issues:
+            counts[iss.issue_type] = counts.get(iss.issue_type, 0) + 1
+        parts = [f"{v} {k}" for k, v in sorted(counts.items())]
+        summary = f"{len(issues)} issue(s): {', '.join(parts)}. {len(pages)} pages checked."
+
+    return LintResult(issues=issues, health_score=round(score, 1), summary=summary)
