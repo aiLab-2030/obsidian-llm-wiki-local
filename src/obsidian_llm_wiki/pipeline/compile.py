@@ -220,7 +220,9 @@ def _inject_body_sections(body: str, source_paths: list[str], config: Config) ->
     linked = sorted(set(extract_wikilinks(body)))
     see_also_lines = [f"- [[{t}]]" for t in linked if t]
 
-    sections = "\n\n## Sources\n" + "\n".join(source_lines) if source_lines else ""
+    sections = "\n\n## Sources"
+    if source_lines:
+        sections += "\n" + "\n".join(source_lines)
     if see_also_lines:
         sections += "\n\n## See Also\n" + "\n".join(see_also_lines)
 
@@ -429,6 +431,7 @@ def compile_concepts(
                     system=_STUB_WRITE_SYSTEM,
                     num_ctx=config.effective_provider.fast_ctx,
                     num_predict=min(_MAX_STUB_PREDICT, config.effective_provider.fast_ctx),
+                    stage="compile_article",
                 )
             except (StructuredOutputError, LLMBadRequestError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
@@ -498,6 +501,7 @@ def compile_concepts(
                 system=_WRITE_SYSTEM,
                 num_ctx=config.effective_provider.heavy_ctx,
                 num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                stage="compile_article",
             )
         except (StructuredOutputError, LLMBadRequestError) as e:
             log.error("Failed to write '%s': %s", name, e)
@@ -617,6 +621,7 @@ def compile_notes(
             model=config.models.fast,
             system=_PLAN_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            stage="compile_plan",
         )
     except (StructuredOutputError, LLMBadRequestError) as e:
         log.error("Planning failed: %s", e)
@@ -665,6 +670,7 @@ def compile_notes(
                 system=_WRITE_SYSTEM,
                 num_ctx=config.effective_provider.heavy_ctx,
                 num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                stage="compile_article",
             )
         except (StructuredOutputError, LLMBadRequestError) as e:
             log.error("Failed to write '%s': %s", article.title, e)

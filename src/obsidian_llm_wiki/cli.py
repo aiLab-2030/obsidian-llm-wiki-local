@@ -81,6 +81,60 @@ def _load_db(config):
     return StateDB(config.state_db_path)
 
 
+def _model_override_options(f):
+    """Shared decorator adding --fast-model/--heavy-model/--provider/--provider-url."""
+    f = click.option(
+        "--fast-model",
+        "fast_model",
+        default=None,
+        help="Override fast model for this invocation",
+    )(f)
+    f = click.option(
+        "--heavy-model",
+        "heavy_model",
+        default=None,
+        help="Override heavy model for this invocation",
+    )(f)
+    f = click.option(
+        "--provider",
+        "provider_name",
+        default=None,
+        help="Override provider name (ollama, groq, openai, azure, ...)",
+    )(f)
+    f = click.option(
+        "--provider-url",
+        "provider_url",
+        default=None,
+        help="Override provider base URL (e.g. https://api.groq.com/openai/v1)",
+    )(f)
+    return f
+
+
+def _model_override_kwargs(
+    fast_model: str | None,
+    heavy_model: str | None,
+    provider_name: str | None,
+    provider_url: str | None,
+) -> dict:
+    """Pack CLI model-override flags into kwargs for Config.from_vault."""
+    kwargs: dict = {}
+    models: dict = {}
+    if fast_model:
+        models["fast"] = fast_model
+    if heavy_model:
+        models["heavy"] = heavy_model
+    if models:
+        kwargs["models"] = models
+    provider: dict = {}
+    if provider_name:
+        provider["name"] = provider_name
+    if provider_url:
+        provider["url"] = provider_url
+    if provider:
+        kwargs["provider"] = provider
+    return kwargs
+
+
 def _load_deps(config):
     from .client_factory import LLMError, build_client
 
@@ -187,7 +241,9 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
     # Create .gitignore
     gi = vault / ".gitignore"
     if not gi.exists():
-        gi.write_text(".DS_Store\n.olw/chroma/\n.olw/state.db\n.obsidian/workspace.json\n*.log\n")
+        gi.write_text(
+            ".DS_Store\n.olw/chroma/\n.olw/state.db\n.olw/compare/\n.obsidian/workspace.json\n*.log\n"
+        )
 
     console.print(f"[green]Vault initialised:[/green] {vault}")
     console.print("Next steps:")
@@ -668,10 +724,21 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
 @click.option("--all", "ingest_all", is_flag=True, help="Ingest all files in raw/")
 @click.option("--force", is_flag=True, help="Re-ingest already-processed notes")
 @click.argument("paths", nargs=-1, type=click.Path(exists=True))
-def ingest(vault_str, ingest_all, force, paths):
+@_model_override_options
+def ingest(
+    vault_str,
+    ingest_all,
+    force,
+    paths,
+    fast_model,
+    heavy_model,
+    provider_name,
+    provider_url,
+):
     """Analyze raw notes: extract concepts, quality, suggested topics."""
 
-    config = _load_config(vault_str)
+    overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
+    config = _load_config(vault_str, **overrides)
     client, db = _load_deps(config)
 
     if ingest_all:
@@ -762,12 +829,25 @@ def ingest(vault_str, ingest_all, force, paths):
     is_flag=True,
     help="Re-ingest raw notes that previously failed, then compile",
 )
-def compile(vault_str, dry_run, auto_approve, force, legacy, retry_failed):
+@_model_override_options
+def compile(
+    vault_str,
+    dry_run,
+    auto_approve,
+    force,
+    legacy,
+    retry_failed,
+    fast_model,
+    heavy_model,
+    provider_name,
+    provider_url,
+):
     """Synthesize ingested notes into wiki article drafts."""
     from .git_ops import git_commit
     from .pipeline.compile import approve_drafts, compile_concepts, compile_notes
 
-    config = _load_config(vault_str)
+    overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
+    config = _load_config(vault_str, **overrides)
     client, db = _load_deps(config)
 
     # Re-ingest previously failed notes before compiling
@@ -1334,12 +1414,24 @@ def watch(vault_str, auto_approve):
 @click.option("--fix", is_flag=True, help="Create stubs for broken wikilinks")
 @click.option("--max-rounds", default=2, show_default=True, help="Max compile rounds")
 @click.option("--dry-run", is_flag=True, help="Report what would happen, make no changes")
-def run(vault_str, auto_approve, fix, max_rounds, dry_run):
+@_model_override_options
+def run(
+    vault_str,
+    auto_approve,
+    fix,
+    max_rounds,
+    dry_run,
+    fast_model,
+    heavy_model,
+    provider_name,
+    provider_url,
+):
     """Run full pipeline: ingest → compile → lint → [approve]."""
     from .pipeline.lock import pipeline_lock
     from .pipeline.orchestrator import PipelineOrchestrator
 
-    config = _load_config(vault_str)
+    overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
+    config = _load_config(vault_str, **overrides)
     client, db = _load_deps(config)
 
     if dry_run:
@@ -1730,3 +1822,213 @@ def unblock(vault_str, concept):
     console.print(
         f"[dim]{count} rejection(s) remain on record. Next compile will include this concept.[/dim]"
     )
+
+
+# ── compare ───────────────────────────────────────────────────────────────────
+
+
+def _is_cloud_provider(provider_name: str | None) -> bool:
+    from .providers import get_provider
+
+    pname = provider_name or "ollama"
+    info = get_provider(pname)
+    if info is None:
+        return pname != "ollama"
+    return info is not None and not info.is_local
+
+
+def _validate_compare_out_dir(out: Path, config) -> Path:
+    out = out.expanduser().resolve()
+    raw_dir = config.raw_dir.resolve()
+    wiki_dir = config.wiki_dir.resolve()
+    olw_dir = config.olw_dir.resolve()
+    compare_root = (config.olw_dir / "compare").resolve()
+
+    def _is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    if _is_within(out, raw_dir) or _is_within(out, wiki_dir):
+        raise click.BadParameter("--out must not be inside raw/ or wiki/")
+    if _is_within(out, olw_dir) and not _is_within(out, compare_root):
+        raise click.BadParameter("--out under .olw/ is only allowed inside .olw/compare/")
+    return out
+
+
+def _validate_compare_inputs(config, queries_path: str | None) -> None:
+    from .compare.runner import _collect_raw_notes, _validate_queries_path
+
+    try:
+        _collect_raw_notes(config.raw_dir)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+    if queries_path:
+        try:
+            _validate_queries_path(Path(queries_path))
+        except ValueError as e:
+            raise click.BadParameter(str(e)) from e
+
+
+def _validate_compare_sample_n(_ctx, _param, value: int | None) -> int | None:
+    if value is None or value >= 1:
+        return value
+    raise click.BadParameter("must be at least 1")
+
+
+@cli.command(name="compare")
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+@_model_override_options
+@click.option(
+    "--queries",
+    "queries_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Optional compare queries.toml.",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    show_default=True,
+    help="Output directory (default: .olw/compare in the active vault).",
+)
+@click.option("--keep-artifacts", is_flag=True, help="Do not delete ephemeral vaults.")
+@click.option(
+    "--allow-cloud-upload",
+    is_flag=True,
+    help="Required when the challenger uses a cloud provider.",
+)
+@click.option(
+    "--format",
+    "report_format",
+    type=click.Choice(["md", "json", "both"]),
+    default="both",
+    show_default=True,
+    help="Report output format.",
+)
+@click.option(
+    "--sample-n",
+    "sample_n",
+    type=int,
+    default=None,
+    callback=_validate_compare_sample_n,
+    help="Limit compare to first N raw notes (useful for a quick spot-check on large vaults).",
+)
+def compare(
+    vault_str,
+    fast_model,
+    heavy_model,
+    provider_name,
+    provider_url,
+    queries_path,
+    out_dir,
+    keep_artifacts,
+    allow_cloud_upload,
+    report_format,
+    sample_n,
+):
+    """Preview whether switching LLM config would improve your vault."""
+    from .compare.runner import run_compare
+
+    config = _load_config(vault_str)
+    challenger_kwargs = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
+    if not challenger_kwargs:
+        err_console.print("Provide at least one challenger override, e.g. --heavy-model.")
+        sys.exit(1)
+    challenger_config = _load_config(vault_str, **challenger_kwargs)
+
+    current_summary = (
+        config.models.fast,
+        config.models.heavy,
+        config.effective_provider.name,
+        config.effective_provider.url,
+    )
+    challenger_summary = (
+        challenger_config.models.fast,
+        challenger_config.models.heavy,
+        challenger_config.effective_provider.name,
+        challenger_config.effective_provider.url,
+    )
+    if challenger_summary == current_summary:
+        err_console.print("Challenger config is identical to current config.")
+        sys.exit(1)
+
+    _validate_compare_inputs(config, queries_path)
+
+    if _is_cloud_provider(challenger_config.effective_provider.name) and not allow_cloud_upload:
+        err_console.print(
+            "Cloud challenger requires --allow-cloud-upload "
+            "(your raw notes will be sent to the provider)."
+        )
+        sys.exit(1)
+
+    out = (
+        _validate_compare_out_dir(Path(out_dir), config)
+        if out_dir
+        else (config.olw_dir / "compare").resolve()
+    )
+    out.mkdir(parents=True, exist_ok=True)
+
+    sample_label = f"first {sample_n} notes" if sample_n is not None else "all notes"
+    console.print(
+        f"[bold]olw compare[/bold] — active vault preview\n"
+        f"  vault={config.vault}\n"
+        f"  current: fast={config.models.fast} heavy={config.models.heavy} "
+        f"provider={config.effective_provider.name}\n"
+        f"  challenger: fast={challenger_config.models.fast} "
+        f"heavy={challenger_config.models.heavy} "
+        f"provider={challenger_config.effective_provider.name}\n"
+        f"  queries={'enabled' if queries_path else 'disabled'}\n"
+        f"  scope={sample_label}\n"
+        f"  Active vault will not be modified."
+    )
+
+    report = run_compare(
+        current_config=config,
+        challenger_config=challenger_config,
+        out_dir=out,
+        queries_path=Path(queries_path) if queries_path else None,
+        keep_artifacts=keep_artifacts,
+        sample_n=sample_n,
+    )
+
+    from .compare.report import (
+        render_json,
+        render_markdown,
+        render_summary_json,
+        render_switch_config_toml,
+        resolve,
+    )
+
+    resolve(report)
+
+    run_dir = out / report.run_id / "results"
+    if report_format in ("md", "both"):
+        (run_dir / "report.md").write_text(render_markdown(report))
+    if report_format in ("json", "both"):
+        (run_dir / "report.json").write_text(render_json(report))
+    (run_dir / "summary.json").write_text(render_summary_json(report))
+
+    from .compare.models import AdvisorVerdict
+
+    console.print()
+    console.print(f"[green]Run complete:[/green] {report.run_id}")
+    console.print(f"Artifacts: {out / report.run_id}")
+    console.print(f"[bold]Verdict:[/bold] {report.verdict.value}")
+    for reason in report.reasons:
+        console.print(f"  · {reason}")
+    if report.verdict == AdvisorVerdict.SWITCH:
+        console.print("\n[bold]Next step:[/bold] edit wiki.toml and set:")
+        console.print(
+            render_switch_config_toml(
+                fast_model=challenger_config.models.fast,
+                heavy_model=challenger_config.models.heavy,
+                provider_name=challenger_config.effective_provider.name,
+                provider_url=challenger_config.effective_provider.url,
+            ),
+            markup=False,
+        )
