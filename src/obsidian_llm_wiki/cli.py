@@ -31,6 +31,10 @@ from rich.table import Table
 console = Console()
 err_console = Console(stderr=True, style="bold red")
 
+PROJECT_REPO_URL = "https://github.com/kytmanov/obsidian-llm-wiki-local"
+PROJECT_ISSUES_URL = f"{PROJECT_REPO_URL}/issues"
+PROJECT_DISCUSSIONS_URL = f"{PROJECT_REPO_URL}/discussions"
+
 _EXPERIMENTAL_CITATIONS_COPY = (
     "Inline source citations link generated claims back to source pages. "
     "Experimental: small models may omit citations or add noisy markers. "
@@ -252,6 +256,7 @@ def cli():
     """obsidian-llm-wiki (olw) — 100% local Obsidian → wiki pipeline.
 
     Run `olw setup` for interactive configuration.
+    Run `olw support` for bug reports, suggestions, and feedback links.
     """
     import logging
 
@@ -869,6 +874,13 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             "  Next steps:",
             f"    [bold]olw init {init_target}[/bold]",
             "    [bold]olw run[/bold]  (or: olw ingest --all && olw compile)",
+            "",
+            "  Feedback:",
+            "    [bold]olw support[/bold]",
+            (
+                "    [dim]olw does not collect telemetry - bug reports, suggestions, and "
+                "experience notes are the main way this project improves.[/dim]"
+            ),
         ]
         console.print()
         console.print(
@@ -1464,6 +1476,27 @@ def clean(vault_str, yes):
 
 
 @cli.command()
+def support():
+    """Show bug-report, suggestion, and feedback links."""
+
+    console.print("[bold]olw support[/bold]\n")
+    console.print("olw does not collect telemetry.")
+    console.print("If something was confusing, useful, annoying, or missing, please tell us.\n")
+    console.print("Bug reports:")
+    console.print(f"  {PROJECT_ISSUES_URL}\n")
+    console.print("Suggestions and experience reports:")
+    console.print(f"  {PROJECT_DISCUSSIONS_URL}\n")
+    console.print("Source code:")
+    console.print(f"  {PROJECT_REPO_URL}\n")
+    console.print("When reporting a bug, include:")
+    console.print("  - `olw --version`")
+    console.print("  - your OS")
+    console.print("  - how you installed olw")
+    console.print("  - the command you ran")
+    console.print("  - the error message or unexpected behavior")
+
+
+@cli.command()
 @click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
 def doctor(vault_str):
     """Check LLM provider connection, model availability, and vault health."""
@@ -1586,25 +1619,67 @@ def doctor(vault_str):
 @cli.command()
 @click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
 @click.option("--save", is_flag=True, help="Save answer to wiki/queries/")
+@click.option("--synthesize", is_flag=True, help="Save answer to wiki/synthesis/")
 @click.argument("question")
-def query(vault_str, question, save):
+def query(vault_str, question, save, synthesize):
     """Answer a question using your wiki as context (no embeddings needed)."""
     from rich.markdown import Markdown
 
-    from .pipeline.query import run_query
+    from .pipeline.query import SynthesisSaveError, find_existing_synthesis, run_query
 
     config = _load_config(vault_str)
     client, db = _load_deps(config)
+    duplicate_strategy = "keep_existing"
+    if (
+        synthesize
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and find_existing_synthesis(db, question) is not None
+    ):
+        raw_choice = (
+            click.prompt(
+                "Duplicate synthesis exists - keep / suffix / update?",
+                type=click.Choice(["keep", "suffix", "update"], case_sensitive=False),
+                default="keep",
+                show_choices=False,
+            )
+            .strip()
+            .lower()
+        )
+        duplicate_strategy = {
+            "keep": "keep_existing",
+            "suffix": "save_with_suffix",
+            "update": "update_in_place",
+        }[raw_choice]
 
     with console.status("[bold]Searching wiki index…"):
-        answer, pages = run_query(config, client, db, question, save=save)
+        try:
+            result = run_query(
+                config,
+                client,
+                db,
+                question,
+                save=save,
+                synthesize=synthesize,
+                duplicate_strategy=duplicate_strategy,
+            )
+        except SynthesisSaveError as exc:
+            if synthesize:
+                click.echo(str(exc), err=True)
+                raise SystemExit(1) from exc
+            raise
 
-    if pages:
-        console.print(f"[dim]Sources: {', '.join(pages)}[/dim]")
+    if result.selected_pages:
+        console.print(f"[dim]Sources: {', '.join(result.selected_pages)}[/dim]")
     console.print()
-    console.print(Markdown(answer))
-    if save:
+    console.print(Markdown(result.answer))
+    if result.query_save is not None:
         console.print("\n[green]Answer saved to wiki/queries/[/green]")
+    if result.synthesis is not None:
+        if result.synthesis.resolution == "kept_existing":
+            console.print(f"\n[yellow]Existing synthesis kept at {result.synthesis.path}[/yellow]")
+        else:
+            console.print(f"\n[green]Synthesis saved to {result.synthesis.path}[/green]")
 
 
 # ── lint ──────────────────────────────────────────────────────────────────────
