@@ -2,11 +2,25 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-07
+
 ### Added
 
 - Added internal foundation types and reader/engine interfaces for future
   source-aware and pack-oriented features. These are additive and are not
   wired into runtime behavior yet.
+
+### Fixed
+
+- **Saved query/link hygiene** — query and synthesis outputs now strip invented
+  `[[wikilinks]]` that do not resolve to existing pages, preventing broken links
+  from being written into `wiki/queries/` and `wiki/synthesis/`.
+- **Compile overflow diagnostics** — prompt-context retry failures now preserve
+  the `context_too_large` failure category instead of degrading to `other` when
+  reduced retry budgets still cannot fit within the configured context window.
+- **LM Studio smoke/runtime robustness** — smoke model resolution and compile
+  fallback handling were hardened so prompt/context overflow scenarios are more
+  recoverable and easier to diagnose.
 
 ### Changed
 
