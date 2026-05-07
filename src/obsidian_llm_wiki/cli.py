@@ -1396,13 +1396,7 @@ def status(vault_str, show_failed):
 
     pid = lock_holder_pid(config.vault)
     if pid is not None:
-        import os
-
-        try:
-            os.kill(pid, 0)
-            console.print(f"\n[yellow]⚠ Pipeline lock held by PID {pid}[/yellow]")
-        except (ProcessLookupError, PermissionError):
-            console.print(f"\n[dim]Lock file present (PID {pid}) but process not running[/dim]")
+        console.print(f"\n[yellow]⚠ Pipeline lock held by PID {pid}[/yellow]")
     elif has_invalid_lock_file(config.vault):
         console.print("\n[dim]Lock file present but invalid; no live process holds it[/dim]")
 

@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 class FailureReason(StrEnum):
     TRANSIENT = "transient"  # timeout, connection reset — retry
+    TRUNCATED = "truncated"  # model hit output cap or returned empty capped response
     LLM_OUTPUT = "llm_output"  # bad JSON / schema mismatch — structured_output already retried 3×
     MISSING_SOURCES = "missing_sources"  # no readable source files
     UNKNOWN = "unknown"
@@ -248,11 +249,39 @@ def _run_compile(
             {},
         )
 
-    # Classify individual concept failures
-    # compile_concepts returns bare names — we can't know the exact reason
-    # per-concept without changing its return type. Use UNKNOWN for now;
-    # transient failures (timeouts) will bubble up as LLMError above.
+    # Classify individual concept failures from the persisted compile_state error.
+    # compile_concepts already records per-concept failure details in the DB.
     failure_records = [
-        FailureRecord(concept=name, reason=FailureReason.UNKNOWN) for name in failed_names
+        FailureRecord(
+            concept=name,
+            reason=_classify_compile_failure(db, name),
+        )
+        for name in failed_names
     ]
     return draft_paths, failure_records, concept_timings
+
+
+def _classify_compile_failure(db: StateDB, concept_name: str) -> FailureReason:
+    source_paths = db.get_sources_for_concept(concept_name)
+    for source_path in source_paths:
+        row = db.get_compile_state(concept_name, source_path)
+        if row is None or row["status"] != "failed" or not row["error"]:
+            continue
+
+        message = str(row["error"]).lower()
+        if "output truncated" in message or "no usable content" in message:
+            return FailureReason.TRUNCATED
+        if "no readable sources" in message:
+            return FailureReason.MISSING_SOURCES
+        if (
+            "structured output" in message
+            or "json" in message
+            or "context too large" in message
+            or "heavy_ctx" in message
+            or "context length" in message
+            or "n_keep" in message
+            or "http 400" in message
+        ):
+            return FailureReason.LLM_OUTPUT
+
+    return FailureReason.UNKNOWN

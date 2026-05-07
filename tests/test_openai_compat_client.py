@@ -163,3 +163,16 @@ def test_truncated_error_message_suggests_double():
     assert "article_max_tokens" in msg
     # suggested = max(cap*2, 32768) → 32768 here
     assert "32768" in msg
+
+
+def test_truncated_error_message_for_stop_does_not_suggest_raising_cap():
+    err = LLMTruncatedError(
+        provider="ollama",
+        max_tokens=251824,
+        finish_reason="stop",
+    )
+
+    msg = str(err)
+    assert "no usable content" in msg
+    assert "lowering pipeline.article_max_tokens" in msg
+    assert "Raise pipeline.article_max_tokens" not in msg

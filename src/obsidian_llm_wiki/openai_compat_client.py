@@ -65,7 +65,7 @@ class LLMTruncatedError(LLMError):
         self.completion_tokens = completion_tokens
         self.finish_reason = finish_reason
 
-        if max_tokens > 0:
+        if finish_reason in ("length", "max_tokens") and max_tokens > 0:
             suggested = max(max_tokens * 2, 32768)
             detail = (
                 f"output truncated at max_tokens={max_tokens} "
@@ -82,9 +82,11 @@ class LLMTruncatedError(LLMError):
             )
         else:
             detail = (
-                f"model returned empty response (finish_reason={finish_reason or 'unknown'}). "
-                "Likely causes: model context exhausted, response_format rejected silently, "
-                "or model/prompt incompatibility. Check model logs."
+                f"model returned no usable content (finish_reason={finish_reason or 'unknown'}). "
+                "Likely causes: model context exhausted, provider/model incompatibility, or "
+                "an excessively large requested output budget. Check that heavy_ctx matches "
+                "the loaded model context, consider lowering pipeline.article_max_tokens, and "
+                "check model logs."
             )
         super().__init__(f"{provider}: {detail}")
 

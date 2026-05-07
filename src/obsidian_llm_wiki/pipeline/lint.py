@@ -337,10 +337,17 @@ def _add_graph_quality_issues(
             )
         )
 
-    concept_targets = {
-        title.lower() for title, path in title_index.items() if ".drafts" in path.parts
-    }
+    concept_targets: set[str] = set()
     disconnected: list[Path] = []
+    if config.drafts_dir.exists():
+        draft_pages = sorted(config.drafts_dir.rglob("*.md"))
+        for draft in draft_pages:
+            try:
+                meta, _ = parse_note(draft)
+            except Exception:
+                continue
+            concept_targets.add(str(meta.get("title", draft.stem)).lower())
+
     if len(concept_targets) >= 2 and config.drafts_dir.exists():
         for draft in sorted(config.drafts_dir.rglob("*.md")):
             try:

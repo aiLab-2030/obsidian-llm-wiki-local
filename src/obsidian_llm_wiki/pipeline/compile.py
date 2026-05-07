@@ -150,6 +150,7 @@ def _article_num_predict(config: Config, prompt: str, system: str) -> int:
             f"prompt ~{estimated_prompt_tokens} tokens leaves only {available_output} "
             f"for output (need >= {_MIN_ARTICLE_PREDICT}). Reduce sources or raise heavy_ctx."
         )
+
     return max(_MIN_ARTICLE_PREDICT, min(config.pipeline.article_max_tokens, available_output))
 
 
@@ -940,13 +941,16 @@ def compile_concepts(
             continue
 
         try:
-            num_predict = _article_num_predict(
-                config,
-                write_prompt,
-                (
-                    _WRITE_SYSTEM_WITH_CITATIONS
-                    if config.pipeline.inline_source_citations
-                    else _WRITE_SYSTEM
+            num_predict = min(
+                _BUDGET_OUTPUT,
+                _article_num_predict(
+                    config,
+                    write_prompt,
+                    (
+                        _WRITE_SYSTEM_WITH_CITATIONS
+                        if config.pipeline.inline_source_citations
+                        else _WRITE_SYSTEM
+                    ),
                 ),
             )
         except ValueError as e:
@@ -1020,13 +1024,16 @@ def compile_concepts(
                         inline_source_citations=config.pipeline.inline_source_citations,
                     )
                     try:
-                        fallback_num_predict = _article_num_predict(
-                            config,
-                            fallback_prompt,
-                            (
-                                _WRITE_SYSTEM_WITH_CITATIONS
-                                if config.pipeline.inline_source_citations
-                                else _WRITE_SYSTEM
+                        fallback_num_predict = min(
+                            _BUDGET_OUTPUT,
+                            _article_num_predict(
+                                config,
+                                fallback_prompt,
+                                (
+                                    _WRITE_SYSTEM_WITH_CITATIONS
+                                    if config.pipeline.inline_source_citations
+                                    else _WRITE_SYSTEM
+                                ),
                             ),
                         )
                     except ValueError as retry_error:

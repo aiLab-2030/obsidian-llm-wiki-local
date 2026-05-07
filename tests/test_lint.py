@@ -427,6 +427,19 @@ def test_graph_quality_flags_low_concept_connectivity(vault, config, db):
     assert "and 1 more" in connectivity[0].description
 
 
+def test_graph_quality_ignores_draft_aliases_for_connectivity(vault, config, db):
+    write_note(
+        config.drafts_dir / "Alpha.md",
+        {"title": "Alpha", "aliases": ["Alias Alpha"], "tags": [], "status": "draft"},
+        "No links.",
+    )
+
+    result = run_lint(config, db)
+
+    connectivity = [i for i in result.issues if i.issue_type == "graph_connectivity"]
+    assert connectivity == []
+
+
 def test_graph_quality_checks_can_be_disabled(vault, config, db):
     config.pipeline.graph_quality_checks = False
     (config.vault / "Welcome.md").write_text("Welcome. [[create a link]]")
