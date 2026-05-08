@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-05-08
+
+### Fixed
+
+- **Release metadata alignment** — the published package version, runtime
+  `__version__`, and changelog are now aligned again after `v0.8.2` was tagged
+  from code that still declared `0.8.1`, which prevented a new PyPI release
+  from being uploaded.
+
 ## [0.8.1] - 2026-05-07
 
 ### Added
